@@ -12,12 +12,15 @@
         "-lrealsense2"
       ],
       "cflags": [
-        "-std=c++11"
+        "-std=c++17",
+        "-fexceptions",
+        "-frtti"
       ],
       "cflags_cc": [
-        "-std=c++11"
-      ],
-      "conditions": []
+        "-std=c++17",
+        "-fexceptions",
+        "-frtti"
+      ]
     }
   ]
 }

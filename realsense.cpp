@@ -8,8 +8,10 @@
 class RealSenseWrapper {
 public:
     RealSenseWrapper() {
-        // Start the pipeline with default configuration
-        pipe.start();
+        cfg.enable_stream(RS2_STREAM_DEPTH, 640, 480, RS2_FORMAT_Z16, 30);
+        cfg.enable_stream(RS2_STREAM_COLOR, 640, 480, RS2_FORMAT_BGR8, 30);
+
+        pipe.start(cfg);
     }
 
     ~RealSenseWrapper() {
@@ -19,7 +21,7 @@ public:
 
     std::vector<uint16_t> getDepthData(int& width, int& height) {
         // Wait for the next set of frames
-        rs2::frameset frames = pipe.wait_for_frames();
+        rs2::frameset frames = pipe.wait_for_frames(5000);
 
         // Get the depth frame
         rs2::depth_frame depth = frames.get_depth_frame();

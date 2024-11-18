@@ -1,146 +1,138 @@
-// addon.cpp
+// realsense.cpp
 
 #include <nan.h>
 #include <librealsense2/rs.hpp>
+#include <thread>
+#include <atomic>
 #include <vector>
 #include <memory>
 
-class RealSenseWrapper {
+class RealSenseWorker : public Nan::AsyncProgressWorkerBase<char> {
 public:
-    RealSenseWrapper() {
-        cfg.enable_stream(RS2_STREAM_DEPTH, 640, 480, RS2_FORMAT_Z16, 30);
-        cfg.enable_stream(RS2_STREAM_COLOR, 640, 480, RS2_FORMAT_BGR8, 30);
-
-        pipe.start(cfg);
+    RealSenseWorker(Nan::Callback* progressCallback, Nan::Callback* completeCallback)
+        : Nan::AsyncProgressWorkerBase<char>(completeCallback), progressCallback(progressCallback), stopped(false) {
+        // Start the pipeline with default configuration
+        pipe.start();
     }
 
-    ~RealSenseWrapper() {
-        // Stop the pipeline on destruction
+    ~RealSenseWorker() {
+        // Stop the pipeline
         pipe.stop();
     }
 
-    std::vector<uint16_t> getDepthData(int& width, int& height) {
-        // Wait for the next set of frames
-        rs2::frameset frames = pipe.wait_for_frames(5000);
+    void Execute(const Nan::AsyncProgressWorkerBase<char>::ExecutionProgress& progress) override {
+        while (!stopped) {
+            try {
+                rs2::frameset frames = pipe.wait_for_frames(5000);
+                rs2::depth_frame depth = frames.get_depth_frame();
 
-        // Get the depth frame
-        rs2::depth_frame depth = frames.get_depth_frame();
+                int width = depth.get_width();
+                int height = depth.get_height();
+                size_t dataSize = width * height * sizeof(uint16_t);
 
-        // Get frame dimensions
-        width = depth.get_width();
-        height = depth.get_height();
+                // Prepare data to send
+                std::vector<char> buffer(sizeof(int) * 2 + dataSize);
+                char* ptr = buffer.data();
 
-        // Copy the depth data
-        size_t size = width * height;
-        std::vector<uint16_t> data(size);
-        memcpy(data.data(), depth.get_data(), size * sizeof(uint16_t));
+                // Copy width and height
+                memcpy(ptr, &width, sizeof(int));
+                ptr += sizeof(int);
+                memcpy(ptr, &height, sizeof(int));
+                ptr += sizeof(int);
 
-        return data;
-    }
+                // Copy depth data
+                memcpy(ptr, depth.get_data(), dataSize);
 
-private:
-    rs2::pipeline pipe;
-};
-
-// Persistent RealSenseWrapper instance
-std::unique_ptr<RealSenseWrapper> rsWrapper;
-
-// Initialize the RealSense camera
-void InitCamera(const Nan::FunctionCallbackInfo<v8::Value>& info) {
-    if (!rsWrapper) {
-        try {
-            rsWrapper = std::make_unique<RealSenseWrapper>();
-            info.GetReturnValue().Set(Nan::New(true));
-        } catch (const rs2::error& e) {
-            Nan::ThrowError(e.what());
-        } catch (const std::exception& e) {
-            Nan::ThrowError(e.what());
-        }
-    } else {
-        info.GetReturnValue().Set(Nan::New(false)); // Already initialized
-    }
-}
-
-// Close the RealSense camera
-void CloseCamera(const Nan::FunctionCallbackInfo<v8::Value>& info) {
-    if (rsWrapper) {
-        rsWrapper.reset();
-        info.GetReturnValue().Set(Nan::New(true));
-    } else {
-        info.GetReturnValue().Set(Nan::New(false)); // Already closed
-    }
-}
-
-// Asynchronous worker to get depth data
-class GetDepthDataWorker : public Nan::AsyncWorker {
-public:
-    GetDepthDataWorker(Nan::Callback* callback)
-        : Nan::AsyncWorker(callback) {}
-
-    void Execute() override {
-        if (!rsWrapper) {
-            SetErrorMessage("Camera is not initialized.");
-            return;
-        }
-
-        try {
-            depthData = rsWrapper->getDepthData(width, height);
-        } catch (const rs2::error& e) {
-            SetErrorMessage(e.what());
-        } catch (const std::exception& e) {
-            SetErrorMessage(e.what());
+                // Send the data to Node.js
+                progress.Send(buffer.data(), buffer.size());
+            } catch (const rs2::error& e) {
+                SetErrorMessage(e.what());
+                break;
+            } catch (const std::exception& e) {
+                SetErrorMessage(e.what());
+                break;
+            }
         }
     }
 
-    void HandleOKCallback() override {
+    void HandleProgressCallback(const char* data, size_t size) override {
         Nan::HandleScope scope;
 
-        // Create a JavaScript object to hold the depth data and dimensions
-        v8::Local<v8::Object> result = Nan::New<v8::Object>();
+        const char* ptr = data;
+
+        // Extract width and height
+        int width, height;
+        memcpy(&width, ptr, sizeof(int));
+        ptr += sizeof(int);
+        memcpy(&height, ptr, sizeof(int));
+        ptr += sizeof(int);
+
+        size_t dataSize = size - 2 * sizeof(int);
 
         // Create a Node.js Buffer from the depth data
-        v8::Local<v8::Object> buffer = Nan::CopyBuffer(
-            reinterpret_cast<char*>(depthData.data()), depthData.size() * sizeof(uint16_t)
-        ).ToLocalChecked();
+        v8::Local<v8::Object> buffer = Nan::CopyBuffer(ptr, dataSize).ToLocalChecked();
 
-        // Set the properties
+        // Create a JavaScript object to hold the data
+        v8::Local<v8::Object> result = Nan::New<v8::Object>();
         Nan::Set(result, Nan::New("width").ToLocalChecked(), Nan::New(width));
         Nan::Set(result, Nan::New("height").ToLocalChecked(), Nan::New(height));
         Nan::Set(result, Nan::New("data").ToLocalChecked(), buffer);
 
-        v8::Local<v8::Value> argv[] = { Nan::Null(), result };
-        callback->Call(2, argv, async_resource);
+        // Call the progress callback with the result
+        v8::Local<v8::Value> argv[] = { result };
+        progressCallback->Call(1, argv, async_resource);
     }
 
-    void HandleErrorCallback() override {
+    void HandleOKCallback() override {
         Nan::HandleScope scope;
+        // Call the completion callback without arguments
+        callback->Call(0, nullptr, async_resource);
+    }
 
-        v8::Local<v8::Value> argv[] = { Nan::Error(ErrorMessage()) };
-        callback->Call(1, argv, async_resource);
+    void Stop() {
+        stopped = true;
     }
 
 private:
-    int width = 0;
-    int height = 0;
-    std::vector<uint16_t> depthData;
+    rs2::pipeline pipe;
+    Nan::Callback* progressCallback;
+    std::atomic<bool> stopped;
 };
 
-// Get depth data asynchronously
-void GetDepthData(const Nan::FunctionCallbackInfo<v8::Value>& info) {
-    if (info.Length() < 1 || !info[0]->IsFunction()) {
-        Nan::ThrowTypeError("Callback function required");
+// Persistent RealSenseWorker instance
+std::unique_ptr<RealSenseWorker> rsWorker;
+
+// Start streaming
+void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
+    if (info.Length() < 2) {
+        Nan::ThrowTypeError("Expected two arguments: progress callback and completion callback");
         return;
     }
 
-    Nan::Callback* callback = new Nan::Callback(info[0].As<v8::Function>());
-    Nan::AsyncQueueWorker(new GetDepthDataWorker(callback));
+    if (!info[0]->IsFunction() || !info[1]->IsFunction()) {
+        Nan::ThrowTypeError("Both arguments must be functions");
+        return;
+    }
+
+    Nan::Callback* progressCallback = new Nan::Callback(info[0].As<v8::Function>());
+    Nan::Callback* completeCallback = new Nan::Callback(info[1].As<v8::Function>());
+
+    rsWorker.reset(new RealSenseWorker(progressCallback, completeCallback));
+    Nan::AsyncQueueWorker(rsWorker.get());
+}
+
+// Stop streaming
+void StopStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
+    if (rsWorker) {
+        rsWorker->Stop();
+        rsWorker.reset();
+    }
 }
 
 // Initialize the addon
 void Init(v8::Local<v8::Object> exports) {
-    Nan::SetMethod(exports, "initCamera", InitCamera);
-    Nan::SetMethod(exports, "closeCamera", CloseCamera);
-    Nan::SetMethod(exports, "getDepthData", GetDepthData);
+    Nan::SetMethod(exports, "startStreaming", StartStreaming);
+    Nan::SetMethod(exports, "stopStreaming", StopStreaming);
 }
 
 NODE_MODULE(addon, Init)

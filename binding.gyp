@@ -2,7 +2,7 @@
   "targets": [
     {
       "target_name": "realsense",
-      "sources": [ "./realsense.cpp" ],
+      "sources": [ "realsense.cpp" ],
       "include_dirs": [
         "<!(node -e \"require('nan')\")",
         "/usr/local/include"

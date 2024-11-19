@@ -6,8 +6,6 @@
 #include <memory>
 #include <chrono>
 
-std::unique_ptr<RealSenseWorker> rsWorker;
-
 int GetIntOption(v8::Local<v8::Object> options, const char* key, int defaultValue) {
     v8::Local<v8::String> v8Key = Nan::New(key).ToLocalChecked();
     if (Nan::Has(options, v8Key).FromJust()) {
@@ -43,6 +41,7 @@ public:
         if (!stopped) {
             pipe.stop();
         }
+        delete progressCallback;
     }
 
     void Execute(const Nan::AsyncProgressWorkerBase<char>::ExecutionProgress& progress) override {
@@ -121,7 +120,9 @@ public:
         };
 
         callback->Call(1, argv, async_resource);
-        rsWorker.reset(); // Reset the worker after error
+
+        // Mark the worker as finished
+        finished = true;
     }
 
     void HandleProgressCallback(const char* data, size_t size) override {
@@ -180,7 +181,9 @@ public:
         Nan::HandleScope scope;
         // Call the completion callback without arguments
         callback->Call(0, nullptr, async_resource);
-        rsWorker.reset(); // Reset the worker after completion
+
+        // Mark the worker as finished
+        finished = true;
     }
 
     void Stop() {
@@ -193,9 +196,13 @@ public:
         }
     }
 
+    bool IsFinished() const {
+        return finished;
+    }
+
 private:
     rs2::pipeline pipe;
-    
+
     Nan::Callback* progressCallback;
     std::atomic<bool> stopped;
 
@@ -210,8 +217,44 @@ private:
 
     // For throttling
     std::chrono::steady_clock::time_point lastFrameTime;
+
+    // Indicates whether the worker has finished execution
+    std::atomic<bool> finished{false};
 };
 
+std::unique_ptr<RealSenseWorker> rsWorker;
+
+// Helper function to periodically check if the worker has finished
+void CheckWorkerFinished(const Nan::FunctionCallbackInfo<v8::Value>& info);
+
+// Stop streaming
+void StopStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
+    if (rsWorker) {
+        rsWorker->Stop();
+
+        // Schedule a check to see if the worker has finished
+        Nan::Callback* callback = new Nan::Callback(
+            [info](const Nan::FunctionCallbackInfo<v8::Value>&) {
+                CheckWorkerFinished(info);
+            }
+        );
+        Nan::AsyncQueueWorker(new Nan::AsyncWorker(callback));
+    }
+}
+
+// Function to check if the worker has finished and reset it
+void CheckWorkerFinished(const Nan::FunctionCallbackInfo<v8::Value>& info) {
+    if (rsWorker && rsWorker->IsFinished()) {
+        rsWorker.reset();
+    } else {
+        // If not finished, check again after a short delay
+        Nan::HandleScope scope;
+        auto isolate = info.GetIsolate();
+        v8::Local<v8::Function> func = Nan::New<v8::FunctionTemplate>(CheckWorkerFinished)->GetFunction(isolate->GetCurrentContext()).ToLocalChecked();
+        v8::Local<v8::Value> argv[] = { info[0] };
+        Nan::Call(func, Nan::GetCurrentContext()->Global(), 1, argv);
+    }
+}
 
 // Start streaming
 void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
@@ -251,15 +294,6 @@ void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
                                        fps, maxFPS,
                                        progressCallback, completeCallback));
     Nan::AsyncQueueWorker(rsWorker.get());
-}
-
-
-void StopStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
-
-    if (rsWorker) {
-        rsWorker->Stop();
-        // rsWorker.reset();
-    }
 }
 
 // Initialize the addon

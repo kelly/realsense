@@ -5,6 +5,8 @@
 #include <vector>
 #include <memory>
 #include <chrono>
+#include <queue>
+#include <mutex>
 #include <uv.h>
 
 int GetIntOption(v8::Local<v8::Object> options, const char* key, int defaultValue) {
@@ -18,13 +20,23 @@ int GetIntOption(v8::Local<v8::Object> options, const char* key, int defaultValu
     return defaultValue;
 }
 
-class RealSenseWorker : public Nan::AsyncProgressWorkerBase<char> {
+struct FrameData {
+    int depthWidth;
+    int depthHeight;
+    std::vector<uint16_t> depthData;
+
+    int colorWidth;
+    int colorHeight;
+    std::vector<uint8_t> colorData; // Assuming BGR8 format
+};
+
+class RealSenseWorker : public Nan::AsyncWorker {
 public:
     RealSenseWorker(int depthWidth, int depthHeight,
                     int colorWidth, int colorHeight,
                     int fps, int maxFPS,
                     Nan::Callback* progressCallback, Nan::Callback* completeCallback)
-        : Nan::AsyncProgressWorkerBase<char>(completeCallback), progressCallback(progressCallback), stopped(false),
+        : Nan::AsyncWorker(completeCallback), progressCallback(progressCallback), stopped(false),
           depthWidth(depthWidth), depthHeight(depthHeight),
           colorWidth(colorWidth), colorHeight(colorHeight),
           fps(fps), maxFPS(maxFPS), finished(false) {
@@ -36,13 +48,17 @@ public:
         pipe.start(cfg);
 
         lastFrameTime = std::chrono::steady_clock::now();
+
+        // Initialize uv_async_t
+        uv_async_init(uv_default_loop(), &asyncHandle, AsyncCallback);
+        asyncHandle.data = this;
     }
 
     ~RealSenseWorker() {
         Stop();
     }
 
-    void Execute(const Nan::AsyncProgressWorkerBase<char>::ExecutionProgress& progress) override {
+    void Execute() override {
         while (!stopped) {
             try {
                 // Implement throttling
@@ -61,42 +77,31 @@ public:
                 rs2::depth_frame depth = frames.get_depth_frame();
                 rs2::video_frame color = frames.get_color_frame();
 
+                FrameData frameData;
+
                 // Depth frame
-                int depthWidth = depth.get_width();
-                int depthHeight = depth.get_height();
-                size_t depthDataSize = depthWidth * depthHeight * sizeof(uint16_t);
+                frameData.depthWidth = depth.get_width();
+                frameData.depthHeight = depth.get_height();
+                size_t depthDataSize = frameData.depthWidth * frameData.depthHeight;
+                frameData.depthData.resize(depthDataSize);
+                memcpy(frameData.depthData.data(), depth.get_data(), depthDataSize * sizeof(uint16_t));
 
                 // Color frame
-                int colorWidth = color.get_width();
-                int colorHeight = color.get_height();
-                size_t colorDataSize = colorWidth * colorHeight * 3; // Assuming BGR8 format
+                frameData.colorWidth = color.get_width();
+                frameData.colorHeight = color.get_height();
+                size_t colorDataSize = frameData.colorWidth * frameData.colorHeight * 3; // Assuming BGR8 format
+                frameData.colorData.resize(colorDataSize);
+                memcpy(frameData.colorData.data(), color.get_data(), colorDataSize);
 
-                // Prepare data to send
-                size_t totalSize = sizeof(int) * 4 + depthDataSize + colorDataSize;
-                std::vector<char> buffer(totalSize);
-                char* ptr = buffer.data();
+                // Push frame data to queue
+                {
+                    std::lock_guard<std::mutex> lock(queueMutex);
+                    frameQueue.push(std::move(frameData));
+                }
 
-                // Copy depth width and height
-                memcpy(ptr, &depthWidth, sizeof(int));
-                ptr += sizeof(int);
-                memcpy(ptr, &depthHeight, sizeof(int));
-                ptr += sizeof(int);
+                // Notify main thread
+                uv_async_send(&asyncHandle);
 
-                // Copy depth data
-                memcpy(ptr, depth.get_data(), depthDataSize);
-                ptr += depthDataSize;
-
-                // Copy color width and height
-                memcpy(ptr, &colorWidth, sizeof(int));
-                ptr += sizeof(int);
-                memcpy(ptr, &colorHeight, sizeof(int));
-                ptr += sizeof(int);
-
-                // Copy color data
-                memcpy(ptr, color.get_data(), colorDataSize);
-
-                // Send the data to Node.js
-                progress.Send(buffer.data(), buffer.size());
             } catch (const rs2::error& e) {
                 SetErrorMessage(e.what());
                 break;
@@ -121,60 +126,61 @@ public:
         callback->Call(1, argv, async_resource);
     }
 
-    void HandleProgressCallback(const char* data, size_t size) override {
+    static void AsyncCallback(uv_async_t* handle) {
+        RealSenseWorker* self = static_cast<RealSenseWorker*>(handle->data);
+        self->ProcessData();
+    }
+
+    void ProcessData() {
         Nan::HandleScope scope;
 
-        const char* ptr = data;
+        std::queue<FrameData> localQueue;
 
-        // Extract depth width and height
-        int depthWidth, depthHeight;
-        memcpy(&depthWidth, ptr, sizeof(int));
-        ptr += sizeof(int);
-        memcpy(&depthHeight, ptr, sizeof(int));
-        ptr += sizeof(int);
+        // Move frames from the shared queue to a local queue
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            std::swap(frameQueue, localQueue);
+        }
 
-        size_t depthDataSize = depthWidth * depthHeight * sizeof(uint16_t);
+        while (!localQueue.empty()) {
+            FrameData& frameData = localQueue.front();
 
-        // Copy depth data into Buffer
-        v8::Local<v8::Object> depthBuffer = Nan::CopyBuffer(ptr, depthDataSize).ToLocalChecked();
-        ptr += depthDataSize;
+            // Create JavaScript objects for depth and color frames
+            v8::Local<v8::Object> depthBuffer = Nan::CopyBuffer(
+                reinterpret_cast<char*>(frameData.depthData.data()),
+                frameData.depthData.size() * sizeof(uint16_t)).ToLocalChecked();
 
-        // Extract color width and height
-        int colorWidth, colorHeight;
-        memcpy(&colorWidth, ptr, sizeof(int));
-        ptr += sizeof(int);
-        memcpy(&colorHeight, ptr, sizeof(int));
-        ptr += sizeof(int);
+            v8::Local<v8::Object> colorBuffer = Nan::CopyBuffer(
+                reinterpret_cast<char*>(frameData.colorData.data()),
+                frameData.colorData.size()).ToLocalChecked();
 
-        size_t colorDataSize = colorWidth * colorHeight * 3; // Assuming BGR8 format
+            v8::Local<v8::Object> depthFrame = Nan::New<v8::Object>();
+            Nan::Set(depthFrame, Nan::New("width").ToLocalChecked(), Nan::New(frameData.depthWidth));
+            Nan::Set(depthFrame, Nan::New("height").ToLocalChecked(), Nan::New(frameData.depthHeight));
+            Nan::Set(depthFrame, Nan::New("data").ToLocalChecked(), depthBuffer);
 
-        // Copy color data into Buffer
-        v8::Local<v8::Object> colorBuffer = Nan::CopyBuffer(ptr, colorDataSize).ToLocalChecked();
-        ptr += colorDataSize;
+            v8::Local<v8::Object> colorFrame = Nan::New<v8::Object>();
+            Nan::Set(colorFrame, Nan::New("width").ToLocalChecked(), Nan::New(frameData.colorWidth));
+            Nan::Set(colorFrame, Nan::New("height").ToLocalChecked(), Nan::New(frameData.colorHeight));
+            Nan::Set(colorFrame, Nan::New("data").ToLocalChecked(), colorBuffer);
 
-        // Create JavaScript objects for depth and color frames
-        v8::Local<v8::Object> depthFrame = Nan::New<v8::Object>();
-        Nan::Set(depthFrame, Nan::New("width").ToLocalChecked(), Nan::New(depthWidth));
-        Nan::Set(depthFrame, Nan::New("height").ToLocalChecked(), Nan::New(depthHeight));
-        Nan::Set(depthFrame, Nan::New("data").ToLocalChecked(), depthBuffer);
+            // Create result object
+            v8::Local<v8::Object> result = Nan::New<v8::Object>();
+            Nan::Set(result, Nan::New("depthFrame").ToLocalChecked(), depthFrame);
+            Nan::Set(result, Nan::New("colorFrame").ToLocalChecked(), colorFrame);
 
-        v8::Local<v8::Object> colorFrame = Nan::New<v8::Object>();
-        Nan::Set(colorFrame, Nan::New("width").ToLocalChecked(), Nan::New(colorWidth));
-        Nan::Set(colorFrame, Nan::New("height").ToLocalChecked(), Nan::New(colorHeight));
-        Nan::Set(colorFrame, Nan::New("data").ToLocalChecked(), colorBuffer);
+            // Call the progress callback with the result
+            v8::Local<v8::Value> argv[] = { result };
+            progressCallback->Call(1, argv, async_resource);
 
-        // Create result object
-        v8::Local<v8::Object> result = Nan::New<v8::Object>();
-        Nan::Set(result, Nan::New("depthFrame").ToLocalChecked(), depthFrame);
-        Nan::Set(result, Nan::New("colorFrame").ToLocalChecked(), colorFrame);
-
-        // Call the progress callback with the result
-        v8::Local<v8::Value> argv[] = { result };
-        progressCallback->Call(1, argv, async_resource);
+            localQueue.pop();
+        }
     }
 
     void HandleOKCallback() override {
-        finished = true;
+        // Clean up the uv_async_t handle
+        uv_close(reinterpret_cast<uv_handle_t*>(&asyncHandle), nullptr);
+
         Nan::HandleScope scope;
         // Call the completion callback without arguments
         callback->Call(0, nullptr, async_resource);
@@ -212,6 +218,13 @@ private:
 
     // To check if the worker has finished
     std::atomic<bool> finished;
+
+    // Frame queue and mutex
+    std::queue<FrameData> frameQueue;
+    std::mutex queueMutex;
+
+    // uv_async_t handle
+    uv_async_t asyncHandle;
 };
 
 std::unique_ptr<RealSenseWorker> rsWorker;

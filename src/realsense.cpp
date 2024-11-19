@@ -249,8 +249,7 @@ void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
 void StopStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
 
     if (rsWorker) {
-        RealSenseWorker* worker = Nan::ObjectWrap::Unwrap<RealSenseWorker>(rsWorker.Get(info.GetIsolate()));
-        worker->Stop();
+        rsWorker->Stop();
         rsWorker.reset();
     }
 }

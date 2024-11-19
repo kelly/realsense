@@ -38,10 +38,7 @@ public:
     }
 
     ~RealSenseWorker() {
-        if (!stopped) {
-            pipe.stop();
-        }
-        delete progressCallback;
+        Stop();
     }
 
     void Execute(const Nan::AsyncProgressWorkerBase<char>::ExecutionProgress& progress) override {
@@ -120,9 +117,6 @@ public:
         };
 
         callback->Call(1, argv, async_resource);
-
-        // Mark the worker as finished
-        finished = true;
     }
 
     void HandleProgressCallback(const char* data, size_t size) override {
@@ -181,9 +175,6 @@ public:
         Nan::HandleScope scope;
         // Call the completion callback without arguments
         callback->Call(0, nullptr, async_resource);
-
-        // Mark the worker as finished
-        finished = true;
     }
 
     void Stop() {
@@ -196,13 +187,9 @@ public:
         }
     }
 
-    bool IsFinished() const {
-        return finished;
-    }
-
 private:
     rs2::pipeline pipe;
-
+    
     Nan::Callback* progressCallback;
     std::atomic<bool> stopped;
 
@@ -217,44 +204,9 @@ private:
 
     // For throttling
     std::chrono::steady_clock::time_point lastFrameTime;
-
-    // Indicates whether the worker has finished execution
-    std::atomic<bool> finished{false};
 };
 
 std::unique_ptr<RealSenseWorker> rsWorker;
-
-// Helper function to periodically check if the worker has finished
-void CheckWorkerFinished(const Nan::FunctionCallbackInfo<v8::Value>& info);
-
-// Stop streaming
-void StopStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
-    if (rsWorker) {
-        rsWorker->Stop();
-
-        // Schedule a check to see if the worker has finished
-        Nan::Callback* callback = new Nan::Callback(
-            [info](const Nan::FunctionCallbackInfo<v8::Value>&) {
-                CheckWorkerFinished(info);
-            }
-        );
-        Nan::AsyncQueueWorker(new Nan::AsyncWorker(callback));
-    }
-}
-
-// Function to check if the worker has finished and reset it
-void CheckWorkerFinished(const Nan::FunctionCallbackInfo<v8::Value>& info) {
-    if (rsWorker && rsWorker->IsFinished()) {
-        rsWorker.reset();
-    } else {
-        // If not finished, check again after a short delay
-        Nan::HandleScope scope;
-        auto isolate = info.GetIsolate();
-        v8::Local<v8::Function> func = Nan::New<v8::FunctionTemplate>(CheckWorkerFinished)->GetFunction(isolate->GetCurrentContext()).ToLocalChecked();
-        v8::Local<v8::Value> argv[] = { info[0] };
-        Nan::Call(func, Nan::GetCurrentContext()->Global(), 1, argv);
-    }
-}
 
 // Start streaming
 void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
@@ -294,6 +246,49 @@ void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
                                        fps, maxFPS,
                                        progressCallback, completeCallback));
     Nan::AsyncQueueWorker(rsWorker.get());
+}
+
+
+void StopStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
+    if (rsWorker) {
+        rsWorker->Stop();
+
+        // Create a new Promise
+        v8::Local<v8::Promise::Resolver> resolver = v8::Promise::Resolver::New(info.GetIsolate());
+
+        // Store the resolver to fulfill it later
+        std::shared_ptr<v8::Persistent<v8::Promise::Resolver>> persistentResolver =
+            std::make_shared<v8::Persistent<v8::Promise::Resolver>>(info.GetIsolate(), resolver);
+
+        // Schedule a check to see if the worker has finished
+        auto checkFinished = [persistentResolver](Nan::CallbackInfo<v8::Value> const&) {
+            if (rsWorker && rsWorker->IsFinished()) {
+                rsWorker.reset();
+                // Fulfill the promise
+                Nan::HandleScope scope;
+                auto isolate = v8::Isolate::GetCurrent();
+                v8::Local<v8::Promise::Resolver> localResolver = persistentResolver->Get(isolate);
+                localResolver->Resolve(isolate->GetCurrentContext(), Nan::Undefined());
+                persistentResolver->Reset();
+            } else {
+                // Schedule another check
+                Nan::HandleScope scope;
+                Nan::AsyncResource asyncResource("CheckWorkerFinished");
+                Nan::SetImmediate(checkFinished);
+            }
+        };
+
+        // Start the checking loop
+        Nan::SetImmediate(checkFinished);
+
+        // Return the promise
+        info.GetReturnValue().Set(resolver->GetPromise());
+    } else {
+        // If there's no worker, return a resolved promise
+        v8::Local<v8::Promise::Resolver> resolver = v8::Promise::Resolver::New(info.GetIsolate());
+        resolver->Resolve(info.GetIsolate()->GetCurrentContext(), Nan::Undefined());
+        info.GetReturnValue().Set(resolver->GetPromise());
+    }
 }
 
 // Initialize the addon

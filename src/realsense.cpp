@@ -10,45 +10,41 @@ class RealSenseWorker : public Nan::AsyncProgressWorkerBase<char> {
 public:
     RealSenseWorker(
         v8::Local<v8::Object> options,
-        v8::Local<v8::Function> progressCallback, 
-        v8::Local<v8::Function> completionCallback,
-        Nan::Callback* callback
-    ) : Nan::AsyncProgressWorkerBase<char>(callback),
+        Nan::Callback* progressCallback,
+        Nan::Callback* completionCallback
+    ) : Nan::AsyncProgressWorkerBase<char>(completionCallback),
+        progressCallback(progressCallback),
         stopped(false) {
-        
-        // Safely capture callbacks
-        this->progressCallback.Reset(progressCallback);
-        this->completionCallback.Reset(completionCallback);
 
         // Extract options safely
         v8::Local<v8::Context> context = Nan::GetCurrentContext();
-        
+
         // Use safe getter with defaults
         depthWidth = Nan::To<int32_t>(
             Nan::Get(options, Nan::New("depthWidth").ToLocalChecked())
             .ToLocalChecked()
         ).FromMaybe(640);
-        
+
         depthHeight = Nan::To<int32_t>(
             Nan::Get(options, Nan::New("depthHeight").ToLocalChecked())
             .ToLocalChecked()
         ).FromMaybe(480);
-        
+
         colorWidth = Nan::To<int32_t>(
             Nan::Get(options, Nan::New("colorWidth").ToLocalChecked())
             .ToLocalChecked()
         ).FromMaybe(640);
-        
+
         colorHeight = Nan::To<int32_t>(
             Nan::Get(options, Nan::New("colorHeight").ToLocalChecked())
             .ToLocalChecked()
         ).FromMaybe(480);
-        
+
         fps = Nan::To<int32_t>(
             Nan::Get(options, Nan::New("fps").ToLocalChecked())
             .ToLocalChecked()
         ).FromMaybe(30);
-        
+
         maxFPS = Nan::To<int32_t>(
             Nan::Get(options, Nan::New("maxFPS").ToLocalChecked())
             .ToLocalChecked()
@@ -57,6 +53,7 @@ public:
 
     ~RealSenseWorker() {
         Stop();
+        delete progressCallback;  // Clean up the progress callback
     }
 
     void Execute(const Nan::AsyncProgressWorkerBase<char>::ExecutionProgress& progress) override {
@@ -65,7 +62,7 @@ public:
             rs2::config cfg;
             cfg.enable_stream(RS2_STREAM_DEPTH, depthWidth, depthHeight, RS2_FORMAT_Z16, fps);
             cfg.enable_stream(RS2_STREAM_COLOR, colorWidth, colorHeight, RS2_FORMAT_BGR8, fps);
-            
+
             rs2::pipeline_profile profile = pipe.start(cfg);
 
             lastFrameTime = std::chrono::steady_clock::now();
@@ -141,77 +138,53 @@ public:
     void HandleProgressCallback(const char* data, size_t size) override {
         Nan::HandleScope scope;
 
-        v8::Local<v8::Function> progressFunc = Nan::New(progressCallback);
-        if (progressFunc.IsEmpty()) return;
+        if (progressCallback) {
+            const char* ptr = data;
 
-        const char* ptr = data;
+            // Extract depth frame details
+            int depthWidth, depthHeight;
+            memcpy(&depthWidth, ptr, sizeof(int));
+            ptr += sizeof(int);
+            memcpy(&depthHeight, ptr, sizeof(int));
+            ptr += sizeof(int);
 
-        // Extract depth frame details
-        int depthWidth, depthHeight;
-        memcpy(&depthWidth, ptr, sizeof(int));
-        ptr += sizeof(int);
-        memcpy(&depthHeight, ptr, sizeof(int));
-        ptr += sizeof(int);
+            size_t depthDataSize = depthWidth * depthHeight * sizeof(uint16_t);
 
-        size_t depthDataSize = depthWidth * depthHeight * sizeof(uint16_t);
+            // Create depth buffer
+            v8::Local<v8::Object> depthBuffer = Nan::CopyBuffer(ptr, depthDataSize).ToLocalChecked();
+            ptr += depthDataSize;
 
-        // Create depth buffer
-        v8::Local<v8::Object> depthBuffer = Nan::CopyBuffer(ptr, depthDataSize).ToLocalChecked();
-        ptr += depthDataSize;
+            // Extract color frame details
+            int colorWidth, colorHeight;
+            memcpy(&colorWidth, ptr, sizeof(int));
+            ptr += sizeof(int);
+            memcpy(&colorHeight, ptr, sizeof(int));
+            ptr += sizeof(int);
 
-        // Extract color frame details
-        int colorWidth, colorHeight;
-        memcpy(&colorWidth, ptr, sizeof(int));
-        ptr += sizeof(int);
-        memcpy(&colorHeight, ptr, sizeof(int));
-        ptr += sizeof(int);
+            size_t colorDataSize = colorWidth * colorHeight * 3;
 
-        size_t colorDataSize = colorWidth * colorHeight * 3;
+            // Create color buffer
+            v8::Local<v8::Object> colorBuffer = Nan::CopyBuffer(ptr, colorDataSize).ToLocalChecked();
 
-        // Create color buffer
-        v8::Local<v8::Object> colorBuffer = Nan::CopyBuffer(ptr, colorDataSize).ToLocalChecked();
+            // Create frame objects
+            v8::Local<v8::Object> depthFrame = Nan::New<v8::Object>();
+            Nan::Set(depthFrame, Nan::New("width").ToLocalChecked(), Nan::New(depthWidth));
+            Nan::Set(depthFrame, Nan::New("height").ToLocalChecked(), Nan::New(depthHeight));
+            Nan::Set(depthFrame, Nan::New("data").ToLocalChecked(), depthBuffer);
 
-        // Create frame objects
-        v8::Local<v8::Object> depthFrame = Nan::New<v8::Object>();
-        Nan::Set(depthFrame, Nan::New("width").ToLocalChecked(), Nan::New(depthWidth));
-        Nan::Set(depthFrame, Nan::New("height").ToLocalChecked(), Nan::New(depthHeight));
-        Nan::Set(depthFrame, Nan::New("data").ToLocalChecked(), depthBuffer);
+            v8::Local<v8::Object> colorFrame = Nan::New<v8::Object>();
+            Nan::Set(colorFrame, Nan::New("width").ToLocalChecked(), Nan::New(colorWidth));
+            Nan::Set(colorFrame, Nan::New("height").ToLocalChecked(), Nan::New(colorHeight));
+            Nan::Set(colorFrame, Nan::New("data").ToLocalChecked(), colorBuffer);
 
-        v8::Local<v8::Object> colorFrame = Nan::New<v8::Object>();
-        Nan::Set(colorFrame, Nan::New("width").ToLocalChecked(), Nan::New(colorWidth));
-        Nan::Set(colorFrame, Nan::New("height").ToLocalChecked(), Nan::New(colorHeight));
-        Nan::Set(colorFrame, Nan::New("data").ToLocalChecked(), colorBuffer);
+            // Create result object
+            v8::Local<v8::Object> result = Nan::New<v8::Object>();
+            Nan::Set(result, Nan::New("depthFrame").ToLocalChecked(), depthFrame);
+            Nan::Set(result, Nan::New("colorFrame").ToLocalChecked(), colorFrame);
 
-        // Create result object
-        v8::Local<v8::Object> result = Nan::New<v8::Object>();
-        Nan::Set(result, Nan::New("depthFrame").ToLocalChecked(), depthFrame);
-        Nan::Set(result, Nan::New("colorFrame").ToLocalChecked(), colorFrame);
-
-        // Call progress callback
-        v8::Local<v8::Value> argv[] = { result };
-        Nan::Call(progressFunc, Nan::GetCurrentContext()->Global(), 1, argv);
-    }
-
-    void HandleOKCallback() override {
-        Nan::HandleScope scope;
-        
-        // Safely call completion callback
-        v8::Local<v8::Function> completeFunc = Nan::New(completionCallback);
-        if (!completeFunc.IsEmpty()) {
-            Nan::Call(completeFunc, Nan::GetCurrentContext()->Global(), 0, nullptr);
-        }
-    }
-
-    void HandleErrorCallback() override {
-        Nan::HandleScope scope;
-
-        // Safely handle error callback
-        v8::Local<v8::Function> completeFunc = Nan::New(completionCallback);
-        if (!completeFunc.IsEmpty()) {
-            v8::Local<v8::Value> argv[] = {
-                Nan::Error(ErrorMessage())
-            };
-            Nan::Call(completeFunc, Nan::GetCurrentContext()->Global(), 1, argv);
+            // Call progress callback
+            v8::Local<v8::Value> argv[] = { result };
+            progressCallback->Call(1, argv, async_resource);
         }
     }
 
@@ -224,10 +197,9 @@ public:
 
 private:
     rs2::pipeline pipe;
-    
-    // Use Nan persistent handles for callbacks
-    Nan::Persistent<v8::Function> progressCallback;
-    Nan::Persistent<v8::Function> completionCallback;
+
+    // Use Nan::Callback for callbacks
+    Nan::Callback* progressCallback;
 
     std::atomic<bool> stopped;
 
@@ -244,9 +216,9 @@ class RealSenseManager {
 public:
     static void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
         // Validate arguments
-        if (info.Length() < 3 || 
-            !info[0]->IsObject() || 
-            !info[1]->IsFunction() || 
+        if (info.Length() < 3 ||
+            !info[0]->IsObject() ||
+            !info[1]->IsFunction() ||
             !info[2]->IsFunction()) {
             return Nan::ThrowTypeError("Expected: options object, progress callback, completion callback");
         }
@@ -254,19 +226,18 @@ public:
         // Stop any existing worker
         if (worker) {
             worker->Stop();
-            delete worker;
             worker = nullptr;
         }
 
-        // Create completion callback for the worker
-        Nan::Callback* callback = new Nan::Callback(info[2].As<v8::Function>());
+        // Create progress and completion callbacks
+        Nan::Callback* progressCallback = new Nan::Callback(info[1].As<v8::Function>());
+        Nan::Callback* completionCallback = new Nan::Callback(info[2].As<v8::Function>());
 
         // Create new worker
         worker = new RealSenseWorker(
-            info[0].As<v8::Object>(), 
-            info[1].As<v8::Function>(),
-            info[2].As<v8::Function>(),
-            callback
+            info[0].As<v8::Object>(),
+            progressCallback,
+            completionCallback
         );
 
         // Queue worker
@@ -276,7 +247,6 @@ public:
     static void StopStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
         if (worker) {
             worker->Stop();
-            delete worker;
             worker = nullptr;
         }
     }

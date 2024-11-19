@@ -6,16 +6,37 @@
 #include <atomic>
 #include <vector>
 #include <memory>
+#include <chrono>
+
+int GetIntOption(v8::Local<v8::Object> options, const char* key, int defaultValue) {
+    v8::Local<v8::String> v8Key = Nan::New(key).ToLocalChecked();
+    if (Nan::Has(options, v8Key).FromJust()) {
+        v8::Local<v8::Value> val = Nan::Get(options, v8Key).ToLocalChecked();
+        if (val->IsNumber()) {
+            return Nan::To<int32_t>(val).FromJust();
+        }
+    }
+    return defaultValue;
+}
 
 class RealSenseWorker : public Nan::AsyncProgressWorkerBase<char> {
 public:
-    RealSenseWorker(Nan::Callback* progressCallback, Nan::Callback* completeCallback)
-        : Nan::AsyncProgressWorkerBase<char>(completeCallback), progressCallback(progressCallback), stopped(false) {
-        // Configure the pipeline to stream depth and color frames
+    RealSenseWorker(int depthWidth, int depthHeight,
+                    int colorWidth, int colorHeight,
+                    int fps, int maxFPS,
+                    Nan::Callback* progressCallback, Nan::Callback* completeCallback)
+        : Nan::AsyncProgressWorkerBase<char>(completeCallback), progressCallback(progressCallback), stopped(false),
+          depthWidth(depthWidth), depthHeight(depthHeight),
+          colorWidth(colorWidth), colorHeight(colorHeight),
+          fps(fps), maxFPS(maxFPS) {
+
+        // Configure the pipeline to stream depth and color frames with the same FPS
         rs2::config cfg;
-        cfg.enable_stream(RS2_STREAM_DEPTH, 640, 480, RS2_FORMAT_Z16, 30);
-        cfg.enable_stream(RS2_STREAM_COLOR, 640, 480, RS2_FORMAT_BGR8, 30);
+        cfg.enable_stream(RS2_STREAM_DEPTH, depthWidth, depthHeight, RS2_FORMAT_Z16, fps);
+        cfg.enable_stream(RS2_STREAM_COLOR, colorWidth, colorHeight, RS2_FORMAT_BGR8, fps);
         pipe.start(cfg);
+
+        lastFrameTime = std::chrono::steady_clock::now();
     }
 
     ~RealSenseWorker() {
@@ -26,6 +47,17 @@ public:
     void Execute(const Nan::AsyncProgressWorkerBase<char>::ExecutionProgress& progress) override {
         while (!stopped) {
             try {
+                // Implement throttling
+                if (maxFPS > 0) {
+                    auto now = std::chrono::steady_clock::now();
+                    auto timeSinceLastFrame = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastFrameTime).count();
+                    int frameInterval = 1000 / maxFPS;
+                    if (timeSinceLastFrame < frameInterval) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(frameInterval - timeSinceLastFrame));
+                    }
+                    lastFrameTime = std::chrono::steady_clock::now();
+                }
+
                 rs2::frameset frames = pipe.wait_for_frames(5000);
 
                 rs2::depth_frame depth = frames.get_depth_frame();
@@ -89,7 +121,6 @@ public:
         memcpy(&depthHeight, ptr, sizeof(int));
         ptr += sizeof(int);
 
-        // Calculate depth data size
         size_t depthDataSize = depthWidth * depthHeight * sizeof(uint16_t);
 
         // Copy depth data into Buffer
@@ -103,14 +134,13 @@ public:
         memcpy(&colorHeight, ptr, sizeof(int));
         ptr += sizeof(int);
 
-        // Calculate color data size
         size_t colorDataSize = colorWidth * colorHeight * 3; // Assuming BGR8 format
 
         // Copy color data into Buffer
         v8::Local<v8::Object> colorBuffer = Nan::CopyBuffer(ptr, colorDataSize).ToLocalChecked();
         ptr += colorDataSize;
 
-        // Create a JavaScript object to hold the data
+        // Create JavaScript objects for depth and color frames
         v8::Local<v8::Object> depthFrame = Nan::New<v8::Object>();
         Nan::Set(depthFrame, Nan::New("width").ToLocalChecked(), Nan::New(depthWidth));
         Nan::Set(depthFrame, Nan::New("height").ToLocalChecked(), Nan::New(depthHeight));
@@ -145,30 +175,22 @@ private:
     rs2::pipeline pipe;
     Nan::Callback* progressCallback;
     std::atomic<bool> stopped;
+
+    int depthWidth;
+    int depthHeight;
+
+    int colorWidth;
+    int colorHeight;
+
+    int fps;
+    int maxFPS;
+
+    // For throttling
+    std::chrono::steady_clock::time_point lastFrameTime;
 };
 
 std::unique_ptr<RealSenseWorker> rsWorker;
 
-// Start streaming
-void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
-    if (info.Length() < 2) {
-        Nan::ThrowTypeError("Expected two arguments: progress callback and completion callback");
-        return;
-    }
-
-    if (!info[0]->IsFunction() || !info[1]->IsFunction()) {
-        Nan::ThrowTypeError("Both arguments must be functions");
-        return;
-    }
-
-    Nan::Callback* progressCallback = new Nan::Callback(info[0].As<v8::Function>());
-    Nan::Callback* completeCallback = new Nan::Callback(info[1].As<v8::Function>());
-
-    rsWorker.reset(new RealSenseWorker(progressCallback, completeCallback));
-    Nan::AsyncQueueWorker(rsWorker.get());
-}
-
-// Stop streaming
 void StopStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
     if (rsWorker) {
         rsWorker->Stop();

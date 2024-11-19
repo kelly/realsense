@@ -5,9 +5,6 @@
 #include <vector>
 #include <memory>
 #include <chrono>
-#include <queue>
-#include <mutex>
-#include <uv.h>
 
 int GetIntOption(v8::Local<v8::Object> options, const char* key, int defaultValue) {
     v8::Local<v8::String> v8Key = Nan::New(key).ToLocalChecked();
@@ -20,26 +17,16 @@ int GetIntOption(v8::Local<v8::Object> options, const char* key, int defaultValu
     return defaultValue;
 }
 
-struct FrameData {
-    int depthWidth;
-    int depthHeight;
-    std::vector<uint16_t> depthData;
-
-    int colorWidth;
-    int colorHeight;
-    std::vector<uint8_t> colorData; // Assuming BGR8 format
-};
-
-class RealSenseWorker : public Nan::AsyncWorker {
+class RealSenseWorker : public Nan::AsyncProgressWorkerBase<char> {
 public:
     RealSenseWorker(int depthWidth, int depthHeight,
                     int colorWidth, int colorHeight,
                     int fps, int maxFPS,
                     Nan::Callback* progressCallback, Nan::Callback* completeCallback)
-        : Nan::AsyncWorker(completeCallback), progressCallback(progressCallback), stopped(false),
+        : Nan::AsyncProgressWorkerBase<char>(completeCallback), progressCallback(progressCallback), stopped(false),
           depthWidth(depthWidth), depthHeight(depthHeight),
           colorWidth(colorWidth), colorHeight(colorHeight),
-          fps(fps), maxFPS(maxFPS), finished(false) {
+          fps(fps), maxFPS(maxFPS) {
 
         // Configure the pipeline to stream depth and color frames with the same FPS
         rs2::config cfg;
@@ -48,17 +35,16 @@ public:
         pipe.start(cfg);
 
         lastFrameTime = std::chrono::steady_clock::now();
-
-        // Initialize uv_async_t
-        uv_async_init(uv_default_loop(), &asyncHandle, AsyncCallback);
-        asyncHandle.data = this;
     }
 
     ~RealSenseWorker() {
-        Stop();
+        if (!stopped) {
+            pipe.stop();
+        }
+        delete progressCallback;
     }
 
-    void Execute() override {
+    void Execute(const Nan::AsyncProgressWorkerBase<char>::ExecutionProgress& progress) override {
         while (!stopped) {
             try {
                 // Implement throttling
@@ -77,31 +63,42 @@ public:
                 rs2::depth_frame depth = frames.get_depth_frame();
                 rs2::video_frame color = frames.get_color_frame();
 
-                FrameData frameData;
-
                 // Depth frame
-                frameData.depthWidth = depth.get_width();
-                frameData.depthHeight = depth.get_height();
-                size_t depthDataSize = frameData.depthWidth * frameData.depthHeight;
-                frameData.depthData.resize(depthDataSize);
-                memcpy(frameData.depthData.data(), depth.get_data(), depthDataSize * sizeof(uint16_t));
+                int depthWidth = depth.get_width();
+                int depthHeight = depth.get_height();
+                size_t depthDataSize = depthWidth * depthHeight * sizeof(uint16_t);
 
                 // Color frame
-                frameData.colorWidth = color.get_width();
-                frameData.colorHeight = color.get_height();
-                size_t colorDataSize = frameData.colorWidth * frameData.colorHeight * 3; // Assuming BGR8 format
-                frameData.colorData.resize(colorDataSize);
-                memcpy(frameData.colorData.data(), color.get_data(), colorDataSize);
+                int colorWidth = color.get_width();
+                int colorHeight = color.get_height();
+                size_t colorDataSize = colorWidth * colorHeight * 3; // Assuming BGR8 format
 
-                // Push frame data to queue
-                {
-                    std::lock_guard<std::mutex> lock(queueMutex);
-                    frameQueue.push(std::move(frameData));
-                }
+                // Prepare data to send
+                size_t totalSize = sizeof(int) * 4 + depthDataSize + colorDataSize;
+                std::vector<char> buffer(totalSize);
+                char* ptr = buffer.data();
 
-                // Notify main thread
-                uv_async_send(&asyncHandle);
+                // Copy depth width and height
+                memcpy(ptr, &depthWidth, sizeof(int));
+                ptr += sizeof(int);
+                memcpy(ptr, &depthHeight, sizeof(int));
+                ptr += sizeof(int);
 
+                // Copy depth data
+                memcpy(ptr, depth.get_data(), depthDataSize);
+                ptr += depthDataSize;
+
+                // Copy color width and height
+                memcpy(ptr, &colorWidth, sizeof(int));
+                ptr += sizeof(int);
+                memcpy(ptr, &colorHeight, sizeof(int));
+                ptr += sizeof(int);
+
+                // Copy color data
+                memcpy(ptr, color.get_data(), colorDataSize);
+
+                // Send the data to Node.js
+                progress.Send(buffer.data(), buffer.size());
             } catch (const rs2::error& e) {
                 SetErrorMessage(e.what());
                 break;
@@ -113,7 +110,6 @@ public:
                 break;
             }
         }
-        finished = true;
     }
 
     void HandleErrorCallback() override {
@@ -124,66 +120,70 @@ public:
         };
 
         callback->Call(1, argv, async_resource);
+
+        // Mark the worker as finished
+        finished = true;
     }
 
-    static void AsyncCallback(uv_async_t* handle) {
-        RealSenseWorker* self = static_cast<RealSenseWorker*>(handle->data);
-        self->ProcessData();
-    }
-
-    void ProcessData() {
+    void HandleProgressCallback(const char* data, size_t size) override {
         Nan::HandleScope scope;
 
-        std::queue<FrameData> localQueue;
+        const char* ptr = data;
 
-        // Move frames from the shared queue to a local queue
-        {
-            std::lock_guard<std::mutex> lock(queueMutex);
-            std::swap(frameQueue, localQueue);
-        }
+        // Extract depth width and height
+        int depthWidth, depthHeight;
+        memcpy(&depthWidth, ptr, sizeof(int));
+        ptr += sizeof(int);
+        memcpy(&depthHeight, ptr, sizeof(int));
+        ptr += sizeof(int);
 
-        while (!localQueue.empty()) {
-            FrameData& frameData = localQueue.front();
+        size_t depthDataSize = depthWidth * depthHeight * sizeof(uint16_t);
 
-            // Create JavaScript objects for depth and color frames
-            v8::Local<v8::Object> depthBuffer = Nan::CopyBuffer(
-                reinterpret_cast<char*>(frameData.depthData.data()),
-                frameData.depthData.size() * sizeof(uint16_t)).ToLocalChecked();
+        // Copy depth data into Buffer
+        v8::Local<v8::Object> depthBuffer = Nan::CopyBuffer(ptr, depthDataSize).ToLocalChecked();
+        ptr += depthDataSize;
 
-            v8::Local<v8::Object> colorBuffer = Nan::CopyBuffer(
-                reinterpret_cast<char*>(frameData.colorData.data()),
-                frameData.colorData.size()).ToLocalChecked();
+        // Extract color width and height
+        int colorWidth, colorHeight;
+        memcpy(&colorWidth, ptr, sizeof(int));
+        ptr += sizeof(int);
+        memcpy(&colorHeight, ptr, sizeof(int));
+        ptr += sizeof(int);
 
-            v8::Local<v8::Object> depthFrame = Nan::New<v8::Object>();
-            Nan::Set(depthFrame, Nan::New("width").ToLocalChecked(), Nan::New(frameData.depthWidth));
-            Nan::Set(depthFrame, Nan::New("height").ToLocalChecked(), Nan::New(frameData.depthHeight));
-            Nan::Set(depthFrame, Nan::New("data").ToLocalChecked(), depthBuffer);
+        size_t colorDataSize = colorWidth * colorHeight * 3; // Assuming BGR8 format
 
-            v8::Local<v8::Object> colorFrame = Nan::New<v8::Object>();
-            Nan::Set(colorFrame, Nan::New("width").ToLocalChecked(), Nan::New(frameData.colorWidth));
-            Nan::Set(colorFrame, Nan::New("height").ToLocalChecked(), Nan::New(frameData.colorHeight));
-            Nan::Set(colorFrame, Nan::New("data").ToLocalChecked(), colorBuffer);
+        // Copy color data into Buffer
+        v8::Local<v8::Object> colorBuffer = Nan::CopyBuffer(ptr, colorDataSize).ToLocalChecked();
+        ptr += colorDataSize;
 
-            // Create result object
-            v8::Local<v8::Object> result = Nan::New<v8::Object>();
-            Nan::Set(result, Nan::New("depthFrame").ToLocalChecked(), depthFrame);
-            Nan::Set(result, Nan::New("colorFrame").ToLocalChecked(), colorFrame);
+        // Create JavaScript objects for depth and color frames
+        v8::Local<v8::Object> depthFrame = Nan::New<v8::Object>();
+        Nan::Set(depthFrame, Nan::New("width").ToLocalChecked(), Nan::New(depthWidth));
+        Nan::Set(depthFrame, Nan::New("height").ToLocalChecked(), Nan::New(depthHeight));
+        Nan::Set(depthFrame, Nan::New("data").ToLocalChecked(), depthBuffer);
 
-            // Call the progress callback with the result
-            v8::Local<v8::Value> argv[] = { result };
-            progressCallback->Call(1, argv, async_resource);
+        v8::Local<v8::Object> colorFrame = Nan::New<v8::Object>();
+        Nan::Set(colorFrame, Nan::New("width").ToLocalChecked(), Nan::New(colorWidth));
+        Nan::Set(colorFrame, Nan::New("height").ToLocalChecked(), Nan::New(colorHeight));
+        Nan::Set(colorFrame, Nan::New("data").ToLocalChecked(), colorBuffer);
 
-            localQueue.pop();
-        }
+        // Create result object
+        v8::Local<v8::Object> result = Nan::New<v8::Object>();
+        Nan::Set(result, Nan::New("depthFrame").ToLocalChecked(), depthFrame);
+        Nan::Set(result, Nan::New("colorFrame").ToLocalChecked(), colorFrame);
+
+        // Call the progress callback with the result
+        v8::Local<v8::Value> argv[] = { result };
+        progressCallback->Call(1, argv, async_resource);
     }
 
     void HandleOKCallback() override {
-        // Clean up the uv_async_t handle
-        uv_close(reinterpret_cast<uv_handle_t*>(&asyncHandle), nullptr);
-
         Nan::HandleScope scope;
         // Call the completion callback without arguments
         callback->Call(0, nullptr, async_resource);
+
+        // Mark the worker as finished
+        finished = true;
     }
 
     void Stop() {
@@ -196,7 +196,9 @@ public:
         }
     }
 
-    bool IsFinished() const { return finished; }
+    bool IsFinished() const {
+        return finished;
+    }
 
 private:
     rs2::pipeline pipe;
@@ -216,18 +218,21 @@ private:
     // For throttling
     std::chrono::steady_clock::time_point lastFrameTime;
 
-    // To check if the worker has finished
-    std::atomic<bool> finished;
-
-    // Frame queue and mutex
-    std::queue<FrameData> frameQueue;
-    std::mutex queueMutex;
-
-    // uv_async_t handle
-    uv_async_t asyncHandle;
+    // Indicates whether the worker has finished execution
+    std::atomic<bool> finished{false};
 };
 
 std::unique_ptr<RealSenseWorker> rsWorker;
+
+// Function to check if the worker has finished and reset it
+void CheckWorkerFinished() {
+    if (rsWorker && rsWorker->IsFinished()) {
+        rsWorker.reset();
+    } else {
+        // Schedule another check after a short delay
+        Nan::SetImmediate(CheckWorkerFinished);
+    }
+}
 
 // Start streaming
 void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
@@ -269,67 +274,13 @@ void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
     Nan::AsyncQueueWorker(rsWorker.get());
 }
 
+// Stop streaming
 void StopStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
-    v8::Isolate* isolate = info.GetIsolate();
-    v8::Local<v8::Context> context = isolate->GetCurrentContext();
-
     if (rsWorker) {
         rsWorker->Stop();
 
-        v8::MaybeLocal<v8::Promise::Resolver> maybeResolver = v8::Promise::Resolver::New(context);
-        v8::Local<v8::Promise::Resolver> resolver;
-        if (!maybeResolver.ToLocal(&resolver)) {
-            Nan::ThrowError("Failed to create Promise::Resolver");
-            return;
-        }
-        info.GetReturnValue().Set(resolver->GetPromise());
-
-        // Store the resolver
-        auto persistentResolver = new Nan::Persistent<v8::Promise::Resolver>(resolver);
-
-        // Create a timer to check if the worker has finished
-        uv_timer_t* timer = new uv_timer_t;
-        timer->data = persistentResolver;
-
-        uv_timer_init(uv_default_loop(), timer);
-
-        uv_timer_start(timer, [](uv_timer_t* handle) {
-            auto persistentResolver = static_cast<Nan::Persistent<v8::Promise::Resolver>*>(handle->data);
-            v8::Isolate* isolate = v8::Isolate::GetCurrent();
-            v8::HandleScope scope(isolate);
-            v8::Local<v8::Context> context = isolate->GetCurrentContext();
-
-            if (rsWorker == nullptr || rsWorker->IsFinished()) {
-                // Stop the timer
-                uv_timer_stop(handle);
-                uv_close((uv_handle_t*)handle, [](uv_handle_t* h) { delete h; });
-
-                // Resolve the promise
-                v8::Local<v8::Promise::Resolver> resolver = persistentResolver->Get(isolate);
-                v8::Maybe<bool> didResolve = resolver->Resolve(context, Nan::Undefined());
-                if (didResolve.IsNothing() || !didResolve.FromJust()) {
-                    Nan::ThrowError("Failed to resolve the promise");
-                }
-
-                persistentResolver->Reset();
-                delete persistentResolver;
-                rsWorker.reset();
-            }
-        }, 0, 100); // Check every 100 ms
-    } else {
-        // If there's no worker, return a resolved promise
-        v8::MaybeLocal<v8::Promise::Resolver> maybeResolver = v8::Promise::Resolver::New(context);
-        v8::Local<v8::Promise::Resolver> resolver;
-        if (!maybeResolver.ToLocal(&resolver)) {
-            Nan::ThrowError("Failed to create Promise::Resolver");
-            return;
-        }
-        v8::Maybe<bool> didResolve = resolver->Resolve(context, Nan::Undefined());
-        if (didResolve.IsNothing() || !didResolve.FromJust()) {
-            Nan::ThrowError("Failed to resolve the promise");
-            return;
-        }
-        info.GetReturnValue().Set(resolver->GetPromise());
+        // Schedule a check to see if the worker has finished
+        Nan::SetImmediate(CheckWorkerFinished);
     }
 }
 

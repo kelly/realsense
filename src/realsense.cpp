@@ -1,5 +1,3 @@
-// realsense.cpp
-
 #include <nan.h>
 #include <librealsense2/rs.hpp>
 #include <thread>
@@ -17,6 +15,41 @@ int GetIntOption(v8::Local<v8::Object> options, const char* key, int defaultValu
         }
     }
     return defaultValue;
+}
+
+// Start streaming
+void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
+    if (info.Length() < 3) {
+        Nan::ThrowTypeError("Expected three arguments: options object, progress callback, and completion callback");
+        return;
+    }
+
+    if (!info[0]->IsObject() || !info[1]->IsFunction() || !info[2]->IsFunction()) {
+        Nan::ThrowTypeError("Expected an options object and two functions");
+        return;
+    }
+
+    v8::Local<v8::Object> options = info[0].As<v8::Object>();
+    Nan::Callback* progressCallback = new Nan::Callback(info[1].As<v8::Function>());
+    Nan::Callback* completeCallback = new Nan::Callback(info[2].As<v8::Function>());
+
+    // Extract options with default values
+    int depthWidth = GetIntOption(options, "depthWidth", 640);
+    int depthHeight = GetIntOption(options, "depthHeight", 480);
+
+    int colorWidth = GetIntOption(options, "colorWidth", 640);
+    int colorHeight = GetIntOption(options, "colorHeight", 480);
+
+    int fps = GetIntOption(options, "fps", 30); // Single FPS parameter
+
+    int maxFPS = GetIntOption(options, "maxFPS", 0); // 0 means no throttling
+
+    // Pass the parameters to the RealSenseWorker constructor
+    rsWorker.reset(new RealSenseWorker(depthWidth, depthHeight,
+                                       colorWidth, colorHeight,
+                                       fps, maxFPS,
+                                       progressCallback, completeCallback));
+    Nan::AsyncQueueWorker(rsWorker.get());
 }
 
 class RealSenseWorker : public Nan::AsyncProgressWorkerBase<char> {

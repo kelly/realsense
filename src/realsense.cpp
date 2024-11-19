@@ -119,6 +119,7 @@ public:
         };
 
         callback->Call(1, argv, async_resource);
+        rsWorker.reset(); // Reset the worker after error
     }
 
     void HandleProgressCallback(const char* data, size_t size) override {
@@ -177,11 +178,11 @@ public:
         Nan::HandleScope scope;
         // Call the completion callback without arguments
         callback->Call(0, nullptr, async_resource);
+        rsWorker.reset(); // Reset the worker after completion
     }
 
     void Stop() {
         if (stopped) return;
-
         stopped = true;
         try {
             pipe.stop();
@@ -213,6 +214,11 @@ std::unique_ptr<RealSenseWorker> rsWorker;
 
 // Start streaming
 void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
+    if (rsWorker) {
+        Nan::ThrowError("Streaming is already started");
+        return;
+    }
+
     if (info.Length() < 3) {
         Nan::ThrowTypeError("Expected three arguments: options object, progress callback, and completion callback");
         return;
@@ -251,7 +257,7 @@ void StopStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
 
     if (rsWorker) {
         rsWorker->Stop();
-        rsWorker.reset();
+        // rsWorker.reset();
     }
 }
 

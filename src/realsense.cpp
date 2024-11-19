@@ -7,52 +7,63 @@
 #include <chrono>
 #include <mutex>
 
-int GetIntOption(v8::Local<v8::Object> options, const char* key, int defaultValue) {
-    v8::Local<v8::String> v8Key = Nan::New(key).ToLocalChecked();
-    if (Nan::Has(options, v8Key).FromJust()) {
-        v8::Local<v8::Value> val = Nan::Get(options, v8Key).ToLocalChecked();
-        if (val->IsNumber()) {
-            return Nan::To<int32_t>(val).FromJust();
-        }
-    }
-    return defaultValue;
-}
-
 class RealSenseWorker : public Nan::AsyncProgressWorkerBase<char> {
 public:
-    RealSenseWorker(int depthWidth, int depthHeight,
-                    int colorWidth, int colorHeight,
-                    int fps, int maxFPS,
-                    Nan::Callback* progressCallback, Nan::Callback* completeCallback)
-        : Nan::AsyncProgressWorkerBase<char>(completeCallback), 
-          progressCallback(progressCallback), 
-          stopped(false),
-          depthWidth(depthWidth), depthHeight(depthHeight),
-          colorWidth(colorWidth), colorHeight(colorHeight),
-          fps(fps), maxFPS(maxFPS) {
+    RealSenseWorker(const v8::Local<v8::Object>& options,
+                    v8::Local<v8::Function> progressCallback, 
+                    v8::Local<v8::Function> completionCallback)
+        : Nan::AsyncProgressWorkerBase<char>(completionCallback),
+          stopped(false) {
         
-        try {
-            // Configure the pipeline to stream depth and color frames with the same FPS
-            rs2::config cfg;
-            cfg.enable_stream(RS2_STREAM_DEPTH, depthWidth, depthHeight, RS2_FORMAT_Z16, fps);
-            cfg.enable_stream(RS2_STREAM_COLOR, colorWidth, colorHeight, RS2_FORMAT_BGR8, fps);
-            pipe.start(cfg);
+        // Safely capture callbacks
+        Nan::Callback* progCb = new Nan::Callback(progressCallback);
+        Nan::Callback* compCb = new Nan::Callback(completionCallback);
+        
+        // Store callbacks safely
+        this->progressCallback.reset(progCb);
+        this->completionCallback.reset(compCb);
 
-            lastFrameTime = std::chrono::steady_clock::now();
-        } catch (const rs2::error& e) {
-            SetErrorMessage(("Pipeline configuration error: " + std::string(e.what())).c_str());
-            stopped = true;
-        }
-    }
+        // Extract options
+        v8::Local<v8::Context> context = Nan::GetCurrentContext();
+        
+        depthWidth = options->Get(context, Nan::New("depthWidth").ToLocalChecked())
+            .ToLocalChecked()->Int32Value(context).FromJust();
+        depthHeight = options->Get(context, Nan::New("depthHeight").ToLocalChecked())
+            .ToLocalChecked()->Int32Value(context).FromJust();
+        
+        colorWidth = options->Get(context, Nan::New("colorWidth").ToLocalChecked())
+            .ToLocalChecked()->Int32Value(context).FromJust();
+        colorHeight = options->Get(context, Nan::New("colorHeight").ToLocalChecked())
+            .ToLocalChecked()->Int32Value(context).FromJust();
+        
+        fps = options->Get(context, Nan::New("fps").ToLocalChecked())
+            .ToLocalChecked()->Int32Value(context).FromJust();
+        
+        maxFPS = options->Get(context, Nan::New("maxFPS").ToLocalChecked())
+            .ToLocalChecked()->Int32Value(context).FromJust();
 
-    ~RealSenseWorker() {
-        Stop();
-        delete progressCallback;
+        // Default values if not provided
+        depthWidth = depthWidth > 0 ? depthWidth : 640;
+        depthHeight = depthHeight > 0 ? depthHeight : 480;
+        colorWidth = colorWidth > 0 ? colorWidth : 640;
+        colorHeight = colorHeight > 0 ? colorHeight : 480;
+        fps = fps > 0 ? fps : 30;
+        maxFPS = maxFPS >= 0 ? maxFPS : 0;
     }
 
     void Execute(const Nan::AsyncProgressWorkerBase<char>::ExecutionProgress& progress) override {
-        while (!stopped) {
-            try {
+        try {
+            // Configure the pipeline safely
+            rs2::config cfg;
+            cfg.enable_stream(RS2_STREAM_DEPTH, depthWidth, depthHeight, RS2_FORMAT_Z16, fps);
+            cfg.enable_stream(RS2_STREAM_COLOR, colorWidth, colorHeight, RS2_FORMAT_BGR8, fps);
+            
+            rs2::pipeline_profile profile = pipe.start(cfg);
+
+            lastFrameTime = std::chrono::steady_clock::now();
+
+            // Main processing loop
+            while (!stopped) {
                 // Throttling mechanism
                 if (maxFPS > 0) {
                     auto now = std::chrono::steady_clock::now();
@@ -64,59 +75,66 @@ public:
                     lastFrameTime = std::chrono::steady_clock::now();
                 }
 
-                // Use a timeout to prevent indefinite blocking
+                // Wait for frames with a timeout
                 rs2::frameset frames = pipe.wait_for_frames(5000);
+                if (!frames) {
+                    // No frames, might want to add some logging or break condition
+                    continue;
+                }
 
                 rs2::depth_frame depth = frames.get_depth_frame();
                 rs2::video_frame color = frames.get_color_frame();
 
-                // Prepare buffers and send data
-                int depthWidth = depth.get_width();
-                int depthHeight = depth.get_height();
-                size_t depthDataSize = depthWidth * depthHeight * sizeof(uint16_t);
+                // Prepare buffers
+                int currentDepthWidth = depth.get_width();
+                int currentDepthHeight = depth.get_height();
+                size_t depthDataSize = currentDepthWidth * currentDepthHeight * sizeof(uint16_t);
 
-                int colorWidth = color.get_width();
-                int colorHeight = color.get_height();
-                size_t colorDataSize = colorWidth * colorHeight * 3;
+                int currentColorWidth = color.get_width();
+                int currentColorHeight = color.get_height();
+                size_t colorDataSize = currentColorWidth * currentColorHeight * 3;
 
+                // Total buffer size
                 size_t totalSize = sizeof(int) * 4 + depthDataSize + colorDataSize;
                 std::vector<char> buffer(totalSize);
                 char* ptr = buffer.data();
 
-                // Copy depth dimensions and data
-                memcpy(ptr, &depthWidth, sizeof(int));
+                // Copy depth frame details
+                memcpy(ptr, &currentDepthWidth, sizeof(int));
                 ptr += sizeof(int);
-                memcpy(ptr, &depthHeight, sizeof(int));
+                memcpy(ptr, &currentDepthHeight, sizeof(int));
                 ptr += sizeof(int);
                 memcpy(ptr, depth.get_data(), depthDataSize);
                 ptr += depthDataSize;
 
-                // Copy color dimensions and data
-                memcpy(ptr, &colorWidth, sizeof(int));
+                // Copy color frame details
+                memcpy(ptr, &currentColorWidth, sizeof(int));
                 ptr += sizeof(int);
-                memcpy(ptr, &colorHeight, sizeof(int));
+                memcpy(ptr, &currentColorHeight, sizeof(int));
                 ptr += sizeof(int);
                 memcpy(ptr, color.get_data(), colorDataSize);
 
                 // Send data to Node.js
                 progress.Send(buffer.data(), buffer.size());
-
-            } catch (const rs2::error& e) {
-                // Log error and potentially break or continue based on error type
-                SetErrorMessage(("RealSense error: " + std::string(e.what())).c_str());
-                break;
-            } catch (const std::exception& e) {
-                SetErrorMessage(("Standard exception: " + std::string(e.what())).c_str());
-                break;
-            } catch (...) {
-                SetErrorMessage("Unknown error occurred");
-                break;
             }
+        } catch (const rs2::error& e) {
+            SetErrorMessage(("RealSense error: " + std::string(e.what())).c_str());
+        } catch (const std::exception& e) {
+            SetErrorMessage(("Standard exception: " + std::string(e.what())).c_str());
+        } catch (...) {
+            SetErrorMessage("Unknown error occurred");
         }
+
+        // Ensure pipeline is stopped
+        try {
+            pipe.stop();
+        } catch (...) {}
     }
 
     void HandleProgressCallback(const char* data, size_t size) override {
         Nan::HandleScope scope;
+
+        if (!progressCallback) return;
 
         const char* ptr = data;
 
@@ -168,34 +186,42 @@ public:
 
     void HandleOKCallback() override {
         Nan::HandleScope scope;
-        callback->Call(0, nullptr, async_resource);
+        
+        // Safely call completion callback if it exists
+        if (completionCallback) {
+            completionCallback->Call(0, nullptr, async_resource);
+        }
     }
 
     void HandleErrorCallback() override {
         Nan::HandleScope scope;
-        v8::Local<v8::Value> argv[] = {
-            Nan::Error(ErrorMessage())
-        };
-        callback->Call(1, argv, async_resource);
+
+        // Safely handle error callback
+        if (completionCallback) {
+            v8::Local<v8::Value> argv[] = {
+                Nan::Error(ErrorMessage())
+            };
+            completionCallback->Call(1, argv, async_resource);
+        }
     }
 
     void Stop() {
-        std::lock_guard<std::mutex> lock(stopMutex);
-        if (stopped) return;
         stopped = true;
         try {
             pipe.stop();
-        } catch (...) {
-            // Silently handle any exceptions during stop
-        }
+        } catch (...) {}
     }
 
 private:
     rs2::pipeline pipe;
-    Nan::Callback* progressCallback;
-    std::atomic<bool> stopped;
-    std::mutex stopMutex;
+    
+    // Use unique_ptr for safe callback management
+    std::unique_ptr<Nan::Callback> progressCallback;
+    std::unique_ptr<Nan::Callback> completionCallback;
 
+    std::atomic<bool> stopped;
+
+    // Frame parameters
     int depthWidth, depthHeight;
     int colorWidth, colorHeight;
     int fps, maxFPS;
@@ -203,59 +229,49 @@ private:
     std::chrono::steady_clock::time_point lastFrameTime;
 };
 
-// Global pointer with careful management
-std::unique_ptr<RealSenseWorker> rsWorker;
-std::mutex rsWorkerMutex;
+// Singleton worker management
+class RealSenseManager {
+public:
+    static void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
+        // Validate arguments
+        if (info.Length() < 3 || 
+            !info[0]->IsObject() || 
+            !info[1]->IsFunction() || 
+            !info[2]->IsFunction()) {
+            return Nan::ThrowTypeError("Expected: options object, progress callback, completion callback");
+        }
 
-void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
-    // Validate input arguments
-    if (info.Length() < 3 || 
-        !info[0]->IsObject() || 
-        !info[1]->IsFunction() || 
-        !info[2]->IsFunction()) {
-        return Nan::ThrowTypeError("Expected: options object, progress callback, completion callback");
+        // Stop any existing worker
+        StopStreaming(Nan::FunctionCallbackInfo<v8::Value>());
+
+        // Create new worker
+        worker.reset(new RealSenseWorker(
+            info[0].As<v8::Object>(), 
+            info[1].As<v8::Function>(),
+            info[2].As<v8::Function>()
+        ));
+
+        // Queue worker
+        Nan::AsyncQueueWorker(worker.get());
     }
 
-    std::lock_guard<std::mutex> lock(rsWorkerMutex);
-
-    // Stop any existing worker before creating a new one
-    if (rsWorker) {
-        rsWorker->Stop();
-        rsWorker.reset();
+    static void StopStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
+        if (worker) {
+            worker->Stop();
+            worker.reset();
+        }
     }
 
-    v8::Local<v8::Object> options = info[0].As<v8::Object>();
-    Nan::Callback* progressCallback = new Nan::Callback(info[1].As<v8::Function>());
-    Nan::Callback* completeCallback = new Nan::Callback(info[2].As<v8::Function>());
-
-    // Extract options with defaults
-    int depthWidth = GetIntOption(options, "depthWidth", 640);
-    int depthHeight = GetIntOption(options, "depthHeight", 480);
-    int colorWidth = GetIntOption(options, "colorWidth", 640);
-    int colorHeight = GetIntOption(options, "colorHeight", 480);
-    int fps = GetIntOption(options, "fps", 30);
-    int maxFPS = GetIntOption(options, "maxFPS", 0);
-
-    // Create and queue worker
-    rsWorker.reset(new RealSenseWorker(depthWidth, depthHeight,
-                                       colorWidth, colorHeight,
-                                       fps, maxFPS,
-                                       progressCallback, completeCallback));
-    Nan::AsyncQueueWorker(rsWorker.get());
-}
-
-void StopStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
-    std::lock_guard<std::mutex> lock(rsWorkerMutex);
-    
-    if (rsWorker) {
-        rsWorker->Stop();
-        rsWorker.reset();
+    static void Init(v8::Local<v8::Object> exports) {
+        Nan::SetMethod(exports, "startStreaming", StartStreaming);
+        Nan::SetMethod(exports, "stopStreaming", StopStreaming);
     }
-}
 
-void Init(v8::Local<v8::Object> exports) {
-    Nan::SetMethod(exports, "startStreaming", StartStreaming);
-    Nan::SetMethod(exports, "stopStreaming", StopStreaming);
-}
+private:
+    static std::unique_ptr<RealSenseWorker> worker;
+};
 
-NODE_MODULE(realsense, Init)
+// Initialize static member
+std::unique_ptr<RealSenseWorker> RealSenseManager::worker;
+
+NODE_MODULE(realsense, RealSenseManager::Init)

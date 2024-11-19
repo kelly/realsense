@@ -3,7 +3,7 @@ const RealSenseCamera = require('../index');
 const camera = new RealSenseCamera();
 
 const options = {
-    depthWidth: 254,
+    depthWidth: 256,
     depthHeight: 144,
     colorWidth: 424,
     colorHeight: 240,

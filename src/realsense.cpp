@@ -179,7 +179,7 @@ public:
     }
 
     void Stop() {
-        if (stopped) return;
+        if (stopped.exchange(true)) return; // Prevent multiple stops
 
         stopped = true;
         try {
@@ -247,9 +247,10 @@ void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
 
 
 void StopStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
-    if (rsWorker) {
-        rsWorker->Stop();
-        rsWorker.reset();
+  if (!rsWorker.IsEmpty()) {
+        RealSenseWorker* worker = Nan::ObjectWrap::Unwrap<RealSenseWorker>(rsWorker.Get(info.GetIsolate()));
+        worker->Stop();
+        rsWorker.Reset();
     }
 }
 

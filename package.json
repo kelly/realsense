@@ -1,6 +1,6 @@
 {
   "name": "realsense",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "description": "Node.js module for Intel RealSense D435i camera",
   "main": "index.js",
   "scripts": {
@@ -15,7 +15,7 @@
     "node-gyp",
     "addon"
   ],
-  "author": "Your Name <your.email@example.com>",
+  "author": "@kelly",
   "license": "MIT",
   "gypfile": true,
   "dependencies": {

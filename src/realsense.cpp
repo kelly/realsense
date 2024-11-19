@@ -39,7 +39,7 @@ public:
 
     ~RealSenseWorker() {
         // Stop the pipeline
-        pipe.stop();
+        Stop();
     }
 
     void Execute(const Nan::AsyncProgressWorkerBase<char>::ExecutionProgress& progress) override {

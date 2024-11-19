@@ -179,6 +179,8 @@ public:
     }
 
     void Stop() {
+        if (stopped) return;
+
         stopped = true;
         try {
             pipe.stop();

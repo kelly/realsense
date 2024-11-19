@@ -5,6 +5,7 @@
 #include <vector>
 #include <memory>
 #include <chrono>
+#include <mutex>
 
 int GetIntOption(v8::Local<v8::Object> options, const char* key, int defaultValue) {
     v8::Local<v8::String> v8Key = Nan::New(key).ToLocalChecked();
@@ -23,31 +24,36 @@ public:
                     int colorWidth, int colorHeight,
                     int fps, int maxFPS,
                     Nan::Callback* progressCallback, Nan::Callback* completeCallback)
-        : Nan::AsyncProgressWorkerBase<char>(completeCallback), progressCallback(progressCallback), stopped(false),
+        : Nan::AsyncProgressWorkerBase<char>(completeCallback), 
+          progressCallback(progressCallback), 
+          stopped(false),
           depthWidth(depthWidth), depthHeight(depthHeight),
           colorWidth(colorWidth), colorHeight(colorHeight),
           fps(fps), maxFPS(maxFPS) {
+        
+        try {
+            // Configure the pipeline to stream depth and color frames with the same FPS
+            rs2::config cfg;
+            cfg.enable_stream(RS2_STREAM_DEPTH, depthWidth, depthHeight, RS2_FORMAT_Z16, fps);
+            cfg.enable_stream(RS2_STREAM_COLOR, colorWidth, colorHeight, RS2_FORMAT_BGR8, fps);
+            pipe.start(cfg);
 
-        // Configure the pipeline to stream depth and color frames with the same FPS
-        rs2::config cfg;
-        cfg.enable_stream(RS2_STREAM_DEPTH, depthWidth, depthHeight, RS2_FORMAT_Z16, fps);
-        cfg.enable_stream(RS2_STREAM_COLOR, colorWidth, colorHeight, RS2_FORMAT_BGR8, fps);
-        pipe.start(cfg);
-
-        lastFrameTime = std::chrono::steady_clock::now();
+            lastFrameTime = std::chrono::steady_clock::now();
+        } catch (const rs2::error& e) {
+            SetErrorMessage(("Pipeline configuration error: " + std::string(e.what())).c_str());
+            stopped = true;
+        }
     }
 
     ~RealSenseWorker() {
-        if (!stopped) {
-            pipe.stop();
-        }
+        Stop();
         delete progressCallback;
     }
 
     void Execute(const Nan::AsyncProgressWorkerBase<char>::ExecutionProgress& progress) override {
         while (!stopped) {
             try {
-                // Implement throttling
+                // Throttling mechanism
                 if (maxFPS > 0) {
                     auto now = std::chrono::steady_clock::now();
                     auto timeSinceLastFrame = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastFrameTime).count();
@@ -58,52 +64,49 @@ public:
                     lastFrameTime = std::chrono::steady_clock::now();
                 }
 
+                // Use a timeout to prevent indefinite blocking
                 rs2::frameset frames = pipe.wait_for_frames(5000);
 
                 rs2::depth_frame depth = frames.get_depth_frame();
                 rs2::video_frame color = frames.get_color_frame();
 
-                // Depth frame
+                // Prepare buffers and send data
                 int depthWidth = depth.get_width();
                 int depthHeight = depth.get_height();
                 size_t depthDataSize = depthWidth * depthHeight * sizeof(uint16_t);
 
-                // Color frame
                 int colorWidth = color.get_width();
                 int colorHeight = color.get_height();
-                size_t colorDataSize = colorWidth * colorHeight * 3; // Assuming BGR8 format
+                size_t colorDataSize = colorWidth * colorHeight * 3;
 
-                // Prepare data to send
                 size_t totalSize = sizeof(int) * 4 + depthDataSize + colorDataSize;
                 std::vector<char> buffer(totalSize);
                 char* ptr = buffer.data();
 
-                // Copy depth width and height
+                // Copy depth dimensions and data
                 memcpy(ptr, &depthWidth, sizeof(int));
                 ptr += sizeof(int);
                 memcpy(ptr, &depthHeight, sizeof(int));
                 ptr += sizeof(int);
-
-                // Copy depth data
                 memcpy(ptr, depth.get_data(), depthDataSize);
                 ptr += depthDataSize;
 
-                // Copy color width and height
+                // Copy color dimensions and data
                 memcpy(ptr, &colorWidth, sizeof(int));
                 ptr += sizeof(int);
                 memcpy(ptr, &colorHeight, sizeof(int));
                 ptr += sizeof(int);
-
-                // Copy color data
                 memcpy(ptr, color.get_data(), colorDataSize);
 
-                // Send the data to Node.js
+                // Send data to Node.js
                 progress.Send(buffer.data(), buffer.size());
+
             } catch (const rs2::error& e) {
-                SetErrorMessage(e.what());
+                // Log error and potentially break or continue based on error type
+                SetErrorMessage(("RealSense error: " + std::string(e.what())).c_str());
                 break;
             } catch (const std::exception& e) {
-                SetErrorMessage(e.what());
+                SetErrorMessage(("Standard exception: " + std::string(e.what())).c_str());
                 break;
             } catch (...) {
                 SetErrorMessage("Unknown error occurred");
@@ -112,25 +115,12 @@ public:
         }
     }
 
-    void HandleErrorCallback() override {
-        Nan::HandleScope scope;
-
-        v8::Local<v8::Value> argv[] = {
-            Nan::Error(ErrorMessage())
-        };
-
-        callback->Call(1, argv, async_resource);
-
-        // Mark the worker as finished
-        finished = true;
-    }
-
     void HandleProgressCallback(const char* data, size_t size) override {
         Nan::HandleScope scope;
 
         const char* ptr = data;
 
-        // Extract depth width and height
+        // Extract depth frame details
         int depthWidth, depthHeight;
         memcpy(&depthWidth, ptr, sizeof(int));
         ptr += sizeof(int);
@@ -139,24 +129,23 @@ public:
 
         size_t depthDataSize = depthWidth * depthHeight * sizeof(uint16_t);
 
-        // Copy depth data into Buffer
+        // Create depth buffer
         v8::Local<v8::Object> depthBuffer = Nan::CopyBuffer(ptr, depthDataSize).ToLocalChecked();
         ptr += depthDataSize;
 
-        // Extract color width and height
+        // Extract color frame details
         int colorWidth, colorHeight;
         memcpy(&colorWidth, ptr, sizeof(int));
         ptr += sizeof(int);
         memcpy(&colorHeight, ptr, sizeof(int));
         ptr += sizeof(int);
 
-        size_t colorDataSize = colorWidth * colorHeight * 3; // Assuming BGR8 format
+        size_t colorDataSize = colorWidth * colorHeight * 3;
 
-        // Copy color data into Buffer
+        // Create color buffer
         v8::Local<v8::Object> colorBuffer = Nan::CopyBuffer(ptr, colorDataSize).ToLocalChecked();
-        ptr += colorDataSize;
 
-        // Create JavaScript objects for depth and color frames
+        // Create frame objects
         v8::Local<v8::Object> depthFrame = Nan::New<v8::Object>();
         Nan::Set(depthFrame, Nan::New("width").ToLocalChecked(), Nan::New(depthWidth));
         Nan::Set(depthFrame, Nan::New("height").ToLocalChecked(), Nan::New(depthHeight));
@@ -172,101 +161,82 @@ public:
         Nan::Set(result, Nan::New("depthFrame").ToLocalChecked(), depthFrame);
         Nan::Set(result, Nan::New("colorFrame").ToLocalChecked(), colorFrame);
 
-        // Call the progress callback with the result
+        // Call progress callback
         v8::Local<v8::Value> argv[] = { result };
         progressCallback->Call(1, argv, async_resource);
     }
 
     void HandleOKCallback() override {
         Nan::HandleScope scope;
-        // Call the completion callback without arguments
         callback->Call(0, nullptr, async_resource);
+    }
 
-        // Mark the worker as finished
-        finished = true;
+    void HandleErrorCallback() override {
+        Nan::HandleScope scope;
+        v8::Local<v8::Value> argv[] = {
+            Nan::Error(ErrorMessage())
+        };
+        callback->Call(1, argv, async_resource);
     }
 
     void Stop() {
+        std::lock_guard<std::mutex> lock(stopMutex);
         if (stopped) return;
         stopped = true;
         try {
             pipe.stop();
         } catch (...) {
-            // Ignore exceptions during cleanup
+            // Silently handle any exceptions during stop
         }
-    }
-
-    bool IsFinished() const {
-        return finished;
     }
 
 private:
     rs2::pipeline pipe;
-
     Nan::Callback* progressCallback;
     std::atomic<bool> stopped;
+    std::mutex stopMutex;
 
-    int depthWidth;
-    int depthHeight;
+    int depthWidth, depthHeight;
+    int colorWidth, colorHeight;
+    int fps, maxFPS;
 
-    int colorWidth;
-    int colorHeight;
-
-    int fps;
-    int maxFPS;
-
-    // For throttling
     std::chrono::steady_clock::time_point lastFrameTime;
-
-    // Indicates whether the worker has finished execution
-    std::atomic<bool> finished{false};
 };
 
+// Global pointer with careful management
 std::unique_ptr<RealSenseWorker> rsWorker;
+std::mutex rsWorkerMutex;
 
-// Function to check if the worker has finished and reset it
-void CheckWorkerFinished() {
-    if (rsWorker && rsWorker->IsFinished()) {
-        rsWorker.reset();
-    } else {
-        // Schedule another check after a short delay
-        Nan::SetImmediate(CheckWorkerFinished);
-    }
-}
-
-// Start streaming
 void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
+    // Validate input arguments
+    if (info.Length() < 3 || 
+        !info[0]->IsObject() || 
+        !info[1]->IsFunction() || 
+        !info[2]->IsFunction()) {
+        return Nan::ThrowTypeError("Expected: options object, progress callback, completion callback");
+    }
+
+    std::lock_guard<std::mutex> lock(rsWorkerMutex);
+
+    // Stop any existing worker before creating a new one
     if (rsWorker) {
-        Nan::ThrowError("Streaming is already started");
-        return;
-    }
-
-    if (info.Length() < 3) {
-        Nan::ThrowTypeError("Expected three arguments: options object, progress callback, and completion callback");
-        return;
-    }
-
-    if (!info[0]->IsObject() || !info[1]->IsFunction() || !info[2]->IsFunction()) {
-        Nan::ThrowTypeError("Expected an options object and two functions");
-        return;
+        rsWorker->Stop();
+        rsWorker.reset();
     }
 
     v8::Local<v8::Object> options = info[0].As<v8::Object>();
     Nan::Callback* progressCallback = new Nan::Callback(info[1].As<v8::Function>());
     Nan::Callback* completeCallback = new Nan::Callback(info[2].As<v8::Function>());
 
-    // Extract options with default values
+    // Extract options with defaults
     int depthWidth = GetIntOption(options, "depthWidth", 640);
     int depthHeight = GetIntOption(options, "depthHeight", 480);
-
     int colorWidth = GetIntOption(options, "colorWidth", 640);
     int colorHeight = GetIntOption(options, "colorHeight", 480);
+    int fps = GetIntOption(options, "fps", 30);
+    int maxFPS = GetIntOption(options, "maxFPS", 0);
 
-    int fps = GetIntOption(options, "fps", 30); // Single FPS parameter
-
-    int maxFPS = GetIntOption(options, "maxFPS", 0); // 0 means no throttling
-
-    // Pass the parameters to the RealSenseWorker constructor
+    // Create and queue worker
     rsWorker.reset(new RealSenseWorker(depthWidth, depthHeight,
                                        colorWidth, colorHeight,
                                        fps, maxFPS,
@@ -274,17 +244,15 @@ void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
     Nan::AsyncQueueWorker(rsWorker.get());
 }
 
-// Stop streaming
 void StopStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
+    std::lock_guard<std::mutex> lock(rsWorkerMutex);
+    
     if (rsWorker) {
         rsWorker->Stop();
-
-        // Schedule a check to see if the worker has finished
-        Nan::SetImmediate(CheckWorkerFinished);
+        rsWorker.reset();
     }
 }
 
-// Initialize the addon
 void Init(v8::Local<v8::Object> exports) {
     Nan::SetMethod(exports, "startStreaming", StartStreaming);
     Nan::SetMethod(exports, "stopStreaming", StopStreaming);

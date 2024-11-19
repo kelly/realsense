@@ -6,6 +6,8 @@
 #include <memory>
 #include <chrono>
 
+std::unique_ptr<RealSenseWorker> rsWorker;
+
 int GetIntOption(v8::Local<v8::Object> options, const char* key, int defaultValue) {
     v8::Local<v8::String> v8Key = Nan::New(key).ToLocalChecked();
     if (Nan::Has(options, v8Key).FromJust()) {
@@ -210,7 +212,6 @@ private:
     std::chrono::steady_clock::time_point lastFrameTime;
 };
 
-std::unique_ptr<RealSenseWorker> rsWorker;
 
 // Start streaming
 void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {

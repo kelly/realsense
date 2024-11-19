@@ -5,6 +5,7 @@
 #include <vector>
 #include <memory>
 #include <chrono>
+#include <uv.h>
 
 int GetIntOption(v8::Local<v8::Object> options, const char* key, int defaultValue) {
     v8::Local<v8::String> v8Key = Nan::New(key).ToLocalChecked();
@@ -26,7 +27,7 @@ public:
         : Nan::AsyncProgressWorkerBase<char>(completeCallback), progressCallback(progressCallback), stopped(false),
           depthWidth(depthWidth), depthHeight(depthHeight),
           colorWidth(colorWidth), colorHeight(colorHeight),
-          fps(fps), maxFPS(maxFPS) {
+          fps(fps), maxFPS(maxFPS), finished(false) {
 
         // Configure the pipeline to stream depth and color frames with the same FPS
         rs2::config cfg;
@@ -107,6 +108,7 @@ public:
                 break;
             }
         }
+        finished = true;
     }
 
     void HandleErrorCallback() override {
@@ -172,6 +174,7 @@ public:
     }
 
     void HandleOKCallback() override {
+        finished = true;
         Nan::HandleScope scope;
         // Call the completion callback without arguments
         callback->Call(0, nullptr, async_resource);
@@ -187,9 +190,11 @@ public:
         }
     }
 
+    bool IsFinished() const { return finished; }
+
 private:
     rs2::pipeline pipe;
-    
+
     Nan::Callback* progressCallback;
     std::atomic<bool> stopped;
 
@@ -204,6 +209,9 @@ private:
 
     // For throttling
     std::chrono::steady_clock::time_point lastFrameTime;
+
+    // To check if the worker has finished
+    std::atomic<bool> finished;
 };
 
 std::unique_ptr<RealSenseWorker> rsWorker;
@@ -248,45 +256,66 @@ void StartStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
     Nan::AsyncQueueWorker(rsWorker.get());
 }
 
-
 void StopStreaming(const Nan::FunctionCallbackInfo<v8::Value>& info) {
+    v8::Isolate* isolate = info.GetIsolate();
+    v8::Local<v8::Context> context = isolate->GetCurrentContext();
+
     if (rsWorker) {
         rsWorker->Stop();
 
-        // Create a new Promise
-        v8::Local<v8::Promise::Resolver> resolver = v8::Promise::Resolver::New(info.GetIsolate());
-
-        // Store the resolver to fulfill it later
-        std::shared_ptr<v8::Persistent<v8::Promise::Resolver>> persistentResolver =
-            std::make_shared<v8::Persistent<v8::Promise::Resolver>>(info.GetIsolate(), resolver);
-
-        // Schedule a check to see if the worker has finished
-        auto checkFinished = [persistentResolver](Nan::CallbackInfo<v8::Value> const&) {
-            if (rsWorker && rsWorker->IsFinished()) {
-                rsWorker.reset();
-                // Fulfill the promise
-                Nan::HandleScope scope;
-                auto isolate = v8::Isolate::GetCurrent();
-                v8::Local<v8::Promise::Resolver> localResolver = persistentResolver->Get(isolate);
-                localResolver->Resolve(isolate->GetCurrentContext(), Nan::Undefined());
-                persistentResolver->Reset();
-            } else {
-                // Schedule another check
-                Nan::HandleScope scope;
-                Nan::AsyncResource asyncResource("CheckWorkerFinished");
-                Nan::SetImmediate(checkFinished);
-            }
-        };
-
-        // Start the checking loop
-        Nan::SetImmediate(checkFinished);
-
-        // Return the promise
+        v8::MaybeLocal<v8::Promise::Resolver> maybeResolver = v8::Promise::Resolver::New(context);
+        v8::Local<v8::Promise::Resolver> resolver;
+        if (!maybeResolver.ToLocal(&resolver)) {
+            Nan::ThrowError("Failed to create Promise::Resolver");
+            return;
+        }
         info.GetReturnValue().Set(resolver->GetPromise());
+
+        // Store the resolver
+        auto persistentResolver = new Nan::Persistent<v8::Promise::Resolver>(resolver);
+
+        // Create a timer to check if the worker has finished
+        uv_timer_t* timer = new uv_timer_t;
+        timer->data = persistentResolver;
+
+        uv_timer_init(uv_default_loop(), timer);
+
+        uv_timer_start(timer, [](uv_timer_t* handle) {
+            auto persistentResolver = static_cast<Nan::Persistent<v8::Promise::Resolver>*>(handle->data);
+            v8::Isolate* isolate = v8::Isolate::GetCurrent();
+            v8::HandleScope scope(isolate);
+            v8::Local<v8::Context> context = isolate->GetCurrentContext();
+
+            if (rsWorker == nullptr || rsWorker->IsFinished()) {
+                // Stop the timer
+                uv_timer_stop(handle);
+                uv_close((uv_handle_t*)handle, [](uv_handle_t* h) { delete h; });
+
+                // Resolve the promise
+                v8::Local<v8::Promise::Resolver> resolver = persistentResolver->Get(isolate);
+                v8::Maybe<bool> didResolve = resolver->Resolve(context, Nan::Undefined());
+                if (didResolve.IsNothing() || !didResolve.FromJust()) {
+                    Nan::ThrowError("Failed to resolve the promise");
+                }
+
+                persistentResolver->Reset();
+                delete persistentResolver;
+                rsWorker.reset();
+            }
+        }, 0, 100); // Check every 100 ms
     } else {
         // If there's no worker, return a resolved promise
-        v8::Local<v8::Promise::Resolver> resolver = v8::Promise::Resolver::New(info.GetIsolate());
-        resolver->Resolve(info.GetIsolate()->GetCurrentContext(), Nan::Undefined());
+        v8::MaybeLocal<v8::Promise::Resolver> maybeResolver = v8::Promise::Resolver::New(context);
+        v8::Local<v8::Promise::Resolver> resolver;
+        if (!maybeResolver.ToLocal(&resolver)) {
+            Nan::ThrowError("Failed to create Promise::Resolver");
+            return;
+        }
+        v8::Maybe<bool> didResolve = resolver->Resolve(context, Nan::Undefined());
+        if (didResolve.IsNothing() || !didResolve.FromJust()) {
+            Nan::ThrowError("Failed to resolve the promise");
+            return;
+        }
         info.GetReturnValue().Set(resolver->GetPromise());
     }
 }

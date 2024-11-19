@@ -29,6 +29,10 @@ camera.on('frame', (frame) => {
     console.log('First 10 color values:', colorArray.slice(0, 30)); // 10 pixels * 3 channels
 });
 
+camera.on('error', (err) => {
+    console.error('An error occurred:', err);
+});
+
 camera.on('end', () => {
     console.log('Streaming ended.');
 });

@@ -103,8 +103,21 @@ public:
             } catch (const std::exception& e) {
                 SetErrorMessage(e.what());
                 break;
+            } catch (...) {
+                SetErrorMessage("Unknown error occurred");
+                break;
             }
         }
+    }
+
+    void HandleErrorCallback() override {
+        Nan::HandleScope scope;
+
+        v8::Local<v8::Value> argv[] = {
+            Nan::Error(ErrorMessage())
+        };
+
+        callback->Call(1, argv, async_resource);
     }
 
     void HandleProgressCallback(const char* data, size_t size) override {
@@ -167,10 +180,16 @@ public:
 
     void Stop() {
         stopped = true;
+        try {
+            pipe.stop();
+        } catch (...) {
+            // Ignore exceptions during cleanup
+        }
     }
 
 private:
     rs2::pipeline pipe;
+    
     Nan::Callback* progressCallback;
     std::atomic<bool> stopped;
 

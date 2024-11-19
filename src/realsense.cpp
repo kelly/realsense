@@ -38,8 +38,9 @@ public:
     }
 
     ~RealSenseWorker() {
-        // Stop the pipeline
-        Stop();
+        if (!stopped) {
+            pipe.stop();
+        }
     }
 
     void Execute(const Nan::AsyncProgressWorkerBase<char>::ExecutionProgress& progress) override {
@@ -179,7 +180,7 @@ public:
     }
 
     void Stop() {
-        if (stopped.exchange(true)) return; // Prevent multiple stops
+        if (stopped) return;
 
         stopped = true;
         try {

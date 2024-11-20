@@ -16,22 +16,30 @@
       "cflags": [
         "-std=c++17", 
         "-fexceptions", 
-        "-frtti",
-        "-fno-exceptions=false"  
+        "-frtti"
       ],
       "cflags_cc": [
         "-std=c++17", 
         "-fexceptions", 
-        "-frtti",
-        "-fno-exceptions=false" 
+        "-frtti"
       ],
-      "xcode_settings": {
-        "OTHER_CFLAGS": [
-          "-fexceptions",
-          "-frtti"
-        ],
-        "GCC_ENABLE_CPP_EXCEPTIONS": "YES"
-      }
+      "conditions": [
+        ['OS=="mac"', {
+          "cflags": [
+            "-fno-exceptions=false"
+          ],
+          "cflags_cc": [
+            "-fno-exceptions=false"
+          ],
+          "xcode_settings": {
+            "GCC_ENABLE_CPP_EXCEPTIONS": "YES",
+            "OTHER_CFLAGS": [
+              "-fexceptions",
+              "-frtti"
+            ]
+          }
+        }],
+      ]
     }
   ]
 }

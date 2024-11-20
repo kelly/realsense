@@ -1,6 +1,6 @@
 {
   "name": "realsense",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "Node.js module for Intel RealSense D435i camera",
   "main": "index.js",
   "scripts": {
